@@ -33,8 +33,8 @@ A Streamlit-based interview platform with:
 ```text
 .
 |- login.py                # Candidate app entrypoint
-|- admin.py                # Admin dashboard entrypoint
 |- pages/
+|  `- admin.py             # Admin dashboard entrypoint
 |  `- interview.py         # Interview experience page
 |- intents.json            # Question/intent data
 |- users.db                # SQLite database (runtime)
@@ -53,3 +53,6 @@ A Streamlit-based interview platform with:
 - Speech mode uses `SpeechRecognition` with Google recognizer.
 - Browser permissions are required for mic/audio features.
 - If microphone fallback is used on your machine, you may also need PyAudio.
+
+##APP LINK
+Applink: https://interview-bot-a4a3uno3n2hha4zqgxbplx.streamlit.app
