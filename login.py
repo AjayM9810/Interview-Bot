@@ -1,11 +1,20 @@
-import base64
+    import base64
 import json
 import datetime
 import re
 import sqlite3
 import html
 from pathlib import Path
+from browser_session import (
+    clear_browser_session,
+    ensure_session_token,
+    restore_browser_session,
+    save_browser_session,
+    set_session_query_param,
+    switch_page,
+)
 import streamlit as st
+import pandas as pd
 from werkzeug.security import check_password_hash, generate_password_hash
 
 # Database setup
@@ -15,7 +24,10 @@ cursor.execute(
     """
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE NOT NULL,
+    username TEXT NOT NULL,
+    display_name TEXT,
+    email TEXT UNIQUE,
+    phone TEXT UNIQUE,
     password_hash TEXT NOT NULL,
     confirm_password_hash TEXT NOT NULL)""")
 conn.commit()
@@ -24,6 +36,7 @@ cursor.execute("""
 CREATE TABLE IF NOT EXISTS candidate_profiles (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT NOT NULL,
+    display_name TEXT,
     phone TEXT,
     email TEXT,
     role TEXT NOT NULL,
@@ -31,6 +44,8 @@ CREATE TABLE IF NOT EXISTS candidate_profiles (
     experience_years INTEGER,
     previous_role TEXT,
     skills TEXT,
+    interview_auth_status TEXT,
+    interview_auth_updated_at TEXT,
     created_at TEXT DEFAULT (datetime('now')),
     FOREIGN KEY(username) REFERENCES users(username)
 )
@@ -56,13 +71,169 @@ CREATE TABLE IF NOT EXISTS interview_results (
 conn.commit()
 
 
+def _username_index_is_unique():
+    try:
+        cursor.execute("PRAGMA index_list(users)")
+    except sqlite3.OperationalError:
+        return False
+    for row in cursor.fetchall():
+        index_name = row[1]
+        is_unique = bool(row[2])
+        if not is_unique:
+            continue
+        cursor.execute(f"PRAGMA index_info({index_name})")
+        columns = [info[2] for info in cursor.fetchall()]
+        if columns == ["username"]:
+            return True
+    return False
+
+
+def _rebuild_users_table(existing_columns):
+    cursor.execute("ALTER TABLE users RENAME TO users_old")
+    cursor.execute(
+        """
+        CREATE TABLE users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            display_name TEXT,
+            email TEXT,
+            phone TEXT,
+            password_hash TEXT NOT NULL,
+            confirm_password_hash TEXT NOT NULL
+        )
+        """
+    )
+    select_exprs = [
+        "id" if "id" in existing_columns else "NULL",
+        "username" if "username" in existing_columns else "''",
+        "display_name" if "display_name" in existing_columns else "NULL",
+        "email" if "email" in existing_columns else "NULL",
+        "phone" if "phone" in existing_columns else "NULL",
+        "password_hash" if "password_hash" in existing_columns else "''",
+        "confirm_password_hash" if "confirm_password_hash" in existing_columns else "''",
+    ]
+    cursor.execute(
+        "INSERT INTO users (id, username, display_name, email, phone, password_hash, confirm_password_hash) "
+        f"SELECT {', '.join(select_exprs)} FROM users_old"
+    )
+    cursor.execute("DROP TABLE users_old")
+
+
+def _normalize_email_value(value):
+    return str(value or "").strip().lower()
+
+
+def _normalize_phone_value(value):
+    return re.sub(r"\D", "", str(value or ""))
+
+
+def _backfill_users_from_profiles():
+    cursor.execute("SELECT id, username, email, phone, display_name FROM users")
+    user_rows = cursor.fetchall()
+    for user_id, username, email, phone, display_name in user_rows:
+        needs_email = not str(email or "").strip()
+        needs_phone = not str(phone or "").strip()
+        needs_name = not str(display_name or "").strip()
+        if not (needs_email or needs_phone or needs_name):
+            continue
+
+        cursor.execute(
+            """
+            SELECT email, phone, display_name
+            FROM candidate_profiles
+            WHERE username = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (username,),
+        )
+        profile_row = cursor.fetchone()
+        if not profile_row:
+            continue
+
+        profile_email, profile_phone, profile_name = profile_row
+        update_fields = {}
+        if needs_email and str(profile_email or "").strip():
+            update_fields["email"] = _normalize_email_value(profile_email)
+        if needs_phone and str(profile_phone or "").strip():
+            update_fields["phone"] = _normalize_phone_value(profile_phone)
+        if needs_name:
+            update_fields["display_name"] = str(profile_name or username).strip() or str(username or "").strip()
+
+        if update_fields:
+            set_clause = ", ".join([f"{column} = ?" for column in update_fields])
+            values = list(update_fields.values()) + [user_id]
+            cursor.execute(f"UPDATE users SET {set_clause} WHERE id = ?", values)
+
+
+def _migrate_usernames_to_email():
+    cursor.execute("SELECT id, username, email, display_name FROM users")
+    user_rows = cursor.fetchall()
+    for user_id, username, email, display_name in user_rows:
+        normalized_email = _normalize_email_value(email)
+        if not normalized_email:
+            continue
+        if normalized_email == str(username or "").strip():
+            continue
+
+        cursor.execute("SELECT 1 FROM users WHERE username = ? AND id <> ? LIMIT 1", (normalized_email, user_id))
+        if cursor.fetchone():
+            continue
+
+        safe_display_name = str(display_name or "").strip() or str(username or "").strip()
+        if safe_display_name:
+            cursor.execute(
+                """
+                UPDATE candidate_profiles
+                SET display_name = COALESCE(NULLIF(display_name, ''), ?)
+                WHERE username = ?
+                """,
+                (safe_display_name, username),
+            )
+            cursor.execute(
+                "UPDATE users SET display_name = COALESCE(NULLIF(display_name, ''), ?) WHERE id = ?",
+                (safe_display_name, user_id),
+            )
+
+        cursor.execute("UPDATE users SET username = ? WHERE id = ?", (normalized_email, user_id))
+        cursor.execute("UPDATE candidate_profiles SET username = ? WHERE username = ?", (normalized_email, username))
+        cursor.execute("UPDATE interview_results SET username = ? WHERE username = ?", (normalized_email, username))
+        try:
+            cursor.execute("UPDATE admin_audit_log SET username = ? WHERE username = ?", (normalized_email, username))
+        except sqlite3.OperationalError:
+            pass
+
+
 def ensure_schema():
     cursor.execute("PRAGMA table_info(users)")
-    columns = {row[1] for row in cursor.fetchall()}
-    if "confirm_password_hash" not in columns:
+    user_columns = {row[1] for row in cursor.fetchall()}
+
+    if _username_index_is_unique():
+        _rebuild_users_table(user_columns)
+        cursor.execute("PRAGMA table_info(users)")
+        user_columns = {row[1] for row in cursor.fetchall()}
+
+    if "email" not in user_columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN email TEXT")
+    if "phone" not in user_columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN phone TEXT")
+    if "display_name" not in user_columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN display_name TEXT")
+    if "confirm_password_hash" not in user_columns:
         cursor.execute("ALTER TABLE users ADD COLUMN confirm_password_hash TEXT NOT NULL DEFAULT ''")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
+    try:
+        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)")
+    except sqlite3.IntegrityError:
+        pass
+    try:
+        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone ON users(phone)")
+    except sqlite3.IntegrityError:
+        pass
     cursor.execute("PRAGMA table_info(candidate_profiles)")
     profile_columns = {row[1] for row in cursor.fetchall()}
+    if "display_name" not in profile_columns:
+        cursor.execute("ALTER TABLE candidate_profiles ADD COLUMN display_name TEXT")
     if "phone" not in profile_columns:
         cursor.execute("ALTER TABLE candidate_profiles ADD COLUMN phone TEXT")
     if "email" not in profile_columns:
@@ -79,6 +250,20 @@ def ensure_schema():
         cursor.execute("ALTER TABLE candidate_profiles ADD COLUMN ban_reason TEXT")
     if "created_at" not in profile_columns:
         cursor.execute("ALTER TABLE candidate_profiles ADD COLUMN created_at TEXT")
+    if "interview_auth_status" not in profile_columns:
+        cursor.execute("ALTER TABLE candidate_profiles ADD COLUMN interview_auth_status TEXT")
+    if "interview_auth_updated_at" not in profile_columns:
+        cursor.execute("ALTER TABLE candidate_profiles ADD COLUMN interview_auth_updated_at TEXT")
+
+    _backfill_users_from_profiles()
+    _migrate_usernames_to_email()
+    cursor.execute(
+        """
+        UPDATE candidate_profiles
+        SET display_name = COALESCE(NULLIF(display_name, ''), username)
+        WHERE display_name IS NULL OR display_name = ''
+        """
+    )
     cursor.execute("UPDATE candidate_profiles SET created_at = datetime('now') WHERE created_at IS NULL OR created_at = ''")
     cursor.execute("PRAGMA table_info(interview_results)")
     result_columns = {row[1] for row in cursor.fetchall()}
@@ -115,33 +300,92 @@ def validate_phone(phone):
     digit_count = sum(char.isdigit() for char in phone)
     return 10 <= digit_count <= 15
 
-def register_user(username, password, confirm_password):
+
+def normalize_email(email):
+    return str(email or "").strip().lower()
+
+
+def normalize_phone(phone):
+    return re.sub(r"\D", "", str(phone or ""))
+
+
+def _collect_existing_contacts():
+    existing_emails = set()
+    existing_phones = set()
+    for table in ("users", "candidate_profiles"):
+        try:
+            cursor.execute(f"SELECT email, phone FROM {table}")
+        except sqlite3.OperationalError:
+            continue
+        for email_value, phone_value in cursor.fetchall():
+            normalized_email = normalize_email(email_value)
+            normalized_phone = normalize_phone(phone_value)
+            if normalized_email:
+                existing_emails.add(normalized_email)
+            if normalized_phone:
+                existing_phones.add(normalized_phone)
+    return existing_emails, existing_phones
+
+
+def register_user(display_name, email, phone, password, confirm_password):
+    normalized_email = normalize_email(email)
+    normalized_phone = normalize_phone(phone)
+    existing_emails, existing_phones = _collect_existing_contacts()
+    if normalized_email and normalized_email in existing_emails:
+        return False, "Email already exists. Please choose another."
+    if normalized_phone and normalized_phone in existing_phones:
+        return False, "Phone number already exists. Please choose another."
+
+    login_id = normalized_email
     try:
         password_hash = generate_password_hash(password)
         confirm_hash = generate_password_hash(confirm_password)
         cursor.execute(
-            "INSERT INTO users (username, password_hash, confirm_password_hash) VALUES (?, ?, ?)",
-            (username, password_hash, confirm_hash),
+            "INSERT INTO users (username, display_name, email, phone, password_hash, confirm_password_hash) VALUES (?, ?, ?, ?, ?, ?)",
+            (login_id, display_name.strip(), normalized_email, normalized_phone, password_hash, confirm_hash),
         )
         conn.commit()
         return True, "Registration successful. You can now log in."
     except sqlite3.IntegrityError:
-        return False, "Username already exists. Please choose another."
+        return False, "Email or phone already exists. Please choose another."
 
-def login_user(username, password):
-    cursor.execute("SELECT password_hash FROM users WHERE username=?", (username,))
-    result = cursor.fetchone()
-    if result:
-        stored_hash = result[0]
-        if check_password_hash(stored_hash, password):
-            return True, "Login successful."
-        else:
-            return False, "Incorrect password. Please try again."
+def login_user(identifier, password):
+    identifier = str(identifier or "").strip()
+    if not identifier:
+        return False, "Please enter your email or phone.", None
+
+    normalized_email = normalize_email(identifier)
+    normalized_phone = normalize_phone(identifier)
+    looks_like_email = validate_email(normalized_email)
+    looks_like_phone = 10 <= len(normalized_phone) <= 15
+
+    user_row = None
+    if looks_like_email:
+        cursor.execute(
+            "SELECT username, password_hash, display_name, email, phone FROM users WHERE email = ?",
+            (normalized_email,),
+        )
+        user_row = cursor.fetchone()
+    elif looks_like_phone:
+        cursor.execute(
+            "SELECT username, password_hash, display_name, email, phone FROM users WHERE phone = ?",
+            (normalized_phone,),
+        )
+        user_row = cursor.fetchone()
     else:
-        return False, "Username not found. Please register first."
+        return False, "Please enter a valid email or phone number.", None
+
+    if not user_row:
+        return False, "Email or phone not found. Please register first.", None
+
+    stored_hash = user_row[1]
+    if check_password_hash(stored_hash, password):
+        return True, "Login successful.", user_row
+    return False, "Incorrect password. Please try again.", None
 
 def save_candidate_profile(
     username,
+    display_name,
     phone,
     email,
     role,
@@ -154,10 +398,21 @@ def save_candidate_profile(
     cursor.execute(
         """
         INSERT INTO candidate_profiles
-        (username, phone, email, role, experience, experience_years, previous_role, skills, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (username, display_name, phone, email, role, experience, experience_years, previous_role, skills, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (username, phone, email, role, experience, experience_years, previous_role, ",".join(skills), created_at)
+        (
+            username,
+            display_name.strip(),
+            phone,
+            email,
+            role,
+            experience,
+            experience_years,
+            previous_role,
+            ",".join(skills),
+            created_at,
+        )
     )
     conn.commit()
 
@@ -193,6 +448,100 @@ def _normalize_keywords(values):
 
 def _escape_html(value):
     return html.escape(str(value or ""), quote=True)
+
+
+def _parse_skill_payload(skills):
+    primary_skill = ""
+    specializations = []
+    for item in skills or []:
+        cleaned = str(item or "").strip()
+        if not cleaned:
+            continue
+        if " - " in cleaned:
+            primary, spec = cleaned.split(" - ", 1)
+            primary = primary.strip()
+            spec = spec.strip()
+            if primary and not primary_skill:
+                primary_skill = primary
+            if spec:
+                specializations.append(spec)
+        else:
+            if not primary_skill:
+                primary_skill = cleaned
+    deduped_specs = []
+    for spec in specializations:
+        if spec and spec not in deduped_specs:
+            deduped_specs.append(spec)
+    return primary_skill, deduped_specs
+
+
+def _render_status_screen(status_title, status_subtitle=None):
+    login_wallpaper_uri = _file_data_uri(r"D:\Interview bot\pexels-jplenio-1103970.jpg")
+    if not login_wallpaper_uri:
+        login_wallpaper_uri = _file_data_uri("pexels-jplenio-1103970.jpg")
+
+    if login_wallpaper_uri:
+        login_background_css = (
+            "background: linear-gradient(135deg, rgba(18, 40, 70, 0.34) 0%, rgba(23, 52, 86, 0.38) 55%, "
+            f"rgba(19, 43, 73, 0.42) 100%), url('{login_wallpaper_uri}') center center / cover no-repeat !important;"
+        )
+    else:
+        login_background_css = (
+            "background: radial-gradient(circle at 18% 12%, rgba(140, 184, 245, 0.58) 0%, rgba(140, 184, 245, 0) 44%), "
+            "radial-gradient(circle at 84% 18%, rgba(114, 189, 212, 0.32) 0%, rgba(114, 189, 212, 0) 38%), "
+            "linear-gradient(180deg, #eef4ff 0%, #deebfb 52%, #d2e0f4 100%) !important;"
+        )
+
+    st.markdown(
+        """
+<style>
+[data-testid="stAppViewContainer"] {
+  __LOGIN_BG__
+}
+[data-testid="stAppViewContainer"] .main {
+  background: transparent !important;
+}
+.brand-bar {
+  max-width: 560px;
+  margin: 0 auto 18px auto !important;
+  padding: 16px 20px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  gap: 10px;
+}
+.brand-title {
+  letter-spacing: 0.12em;
+}
+.brand-subtitle {
+  margin-top: 4px;
+}
+.section-card {
+  max-width: 560px;
+  margin: 0 auto 14px auto !important;
+  text-align: center;
+}
+.status-subtitle {
+  text-align: center;
+  font-size: 15px;
+  color: #e2e8f0;
+  margin-top: -6px;
+}
+</style>
+""".replace("__LOGIN_BG__", login_background_css),
+        unsafe_allow_html=True,
+    )
+
+    if status_title:
+        st.markdown(
+            f"<div class=\"status-box\"><div class=\"status-message\">{_escape_html(status_title)}</div></div>",
+            unsafe_allow_html=True,
+        )
+    if status_subtitle:
+        st.markdown(f"<div class='status-subtitle'>{_escape_html(status_subtitle)}</div>", unsafe_allow_html=True)
+    st.markdown('<div class="status-spacer"></div>', unsafe_allow_html=True)
 
 
 def _file_data_uri(image_path):
@@ -625,7 +974,8 @@ def get_latest_interview_result(username):
 def get_latest_candidate_profile(username):
     cursor.execute(
         """
-        SELECT phone, email, role, experience, previous_role, skills
+        SELECT display_name, phone, email, role, experience, previous_role, skills,
+               interview_auth_status, interview_auth_updated_at
         FROM candidate_profiles
         WHERE username = ?
         ORDER BY id DESC
@@ -637,16 +987,19 @@ def get_latest_candidate_profile(username):
     if not row:
         return None
 
-    raw_skills = row[5] or ""
+    raw_skills = row[6] or ""
     parsed_skills = [skill.strip() for skill in raw_skills.split(",") if skill.strip()]
 
     return {
-        "phone": row[0],
-        "email": row[1],
-        "role": row[2],
-        "experience": row[3],
-        "previous_role": row[4],
+        "display_name": row[0],
+        "phone": row[1],
+        "email": row[2],
+        "role": row[3],
+        "experience": row[4],
+        "previous_role": row[5],
         "skills": parsed_skills,
+        "interview_auth_status": row[7],
+        "interview_auth_updated_at": row[8],
     }
 
 
@@ -759,6 +1112,24 @@ def update_candidate_skills(username, skills):
             ",".join(skills),
             username,
         ),
+    )
+    conn.commit()
+
+
+def set_interview_auth_status(username, status):
+    cursor.execute(
+        """
+        UPDATE candidate_profiles
+        SET interview_auth_status = ?, interview_auth_updated_at = datetime('now')
+        WHERE id = (
+            SELECT id
+            FROM candidate_profiles
+            WHERE username = ?
+            ORDER BY id DESC
+            LIMIT 1
+        )
+        """,
+        (status, username),
     )
     conn.commit()
 
@@ -900,6 +1271,8 @@ def reset_interview_session_state():
         "results_summary",
         "results_saved",
         "policy_violation_summary",
+        "interview_started_at_epoch",
+        "interview_deadline_at_epoch",
         "allow_retest",
         "show_answer_review",
     )
@@ -912,6 +1285,16 @@ def reset_interview_session_state():
     dynamic_keys = [key for key in list(st.session_state.keys()) if key.startswith(dynamic_prefixes)]
     for key in dynamic_keys:
         del st.session_state[key]
+
+
+def logout_candidate(auth_view="login"):
+    clear_browser_session(conn)
+    reset_interview_session_state()
+    st.session_state.logged_in = False
+    st.session_state.username = None
+    st.session_state.display_name = None
+    st.session_state.auth_view = auth_view
+
 # Streamlit UI
 st.set_page_config(page_title="ABC Inc", layout="wide", initial_sidebar_state="collapsed")
 st.markdown(
@@ -939,6 +1322,27 @@ html[data-theme="dark"] {
   --text-secondary: #cedcf3;
   --card-bg: #13233b;
   --card-border: #3d5273;
+}
+
+.status-box {
+  background: linear-gradient(135deg, rgba(11, 77, 182, 0.08) 0%, rgba(24, 169, 153, 0.08) 100%);
+  border: 1px solid var(--card-border);
+  border-radius: 16px;
+  box-shadow: var(--shadow-soft);
+  padding: 18px 20px;
+  text-align: center;
+  margin-bottom: 12px;
+  color: var(--text-primary);
+}
+
+.status-message {
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.status-spacer {
+  height: 6px;
 }
 
 html, body, [class*="css"] {
@@ -1453,16 +1857,24 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+restore_browser_session(conn)
 
 # Session state for authentication
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
 if "username" not in st.session_state:
     st.session_state.username = None
+if "display_name" not in st.session_state:
+    st.session_state.display_name = None
 if "auth_view" not in st.session_state:
     st.session_state.auth_view = "login"
 
 registration_success_message = st.session_state.pop("registration_success_message", None)
+interview_security_notice = st.session_state.pop("interview_security_notice", None)
+
+if st.session_state.get("admin_logged_in", False):
+    switch_page("pages/admin.py")
+    st.stop()
 
 if not st.session_state.logged_in:
     login_wallpaper_uri = _file_data_uri(r"D:\Interview bot\pexels-jplenio-1103970.jpg")
@@ -1571,7 +1983,7 @@ if not st.session_state.logged_in:
             reg_password_confirm = st.text_input("Re-enter Password", type="password", key="reg_pass_confirm")
             st.markdown(
                 """
-<div class="form-hint">
+<div class="form-hint" style="color: #d32f2f;">
 At least 8 characters, uppercase, lowercase, number, special character, and no spaces.
 </div>
 """,
@@ -1600,17 +2012,27 @@ At least 8 characters, uppercase, lowercase, number, special character, and no s
                     if failures:
                         st.error(" ".join(failures))
                     else:
-                        username = reg_name.strip()
+                        display_name = reg_name.strip()
+                        normalized_email = normalize_email(reg_email)
+                        normalized_phone = normalize_phone(reg_phone)
+                        login_id = normalized_email
                         interview_experience = "Fresher"
                         if reg_experience_type == "Experienced":
                             interview_experience = "1-3 years" if reg_experience_years <= 3 else "4-10 years"
 
-                        success, message = register_user(username, reg_password, reg_password_confirm)
+                        success, message = register_user(
+                            display_name,
+                            normalized_email,
+                            normalized_phone,
+                            reg_password,
+                            reg_password_confirm,
+                        )
                         if success:
                             save_candidate_profile(
-                                username,
-                                reg_phone.strip(),
-                                reg_email.strip(),
+                                login_id,
+                                display_name,
+                                normalized_phone,
+                                normalized_email,
                                 reg_role,
                                 interview_experience,
                                 [],
@@ -1618,7 +2040,7 @@ At least 8 characters, uppercase, lowercase, number, special character, and no s
                                 (reg_previous_role or "").strip() or None,
                             )
                             st.session_state["registration_success_message"] = "Registration successful. You can now log in."
-                            st.session_state["login_user"] = username
+                            st.session_state["login_user"] = normalized_email
                             st.session_state.auth_view = "login"
                             st.rerun()
                         else:
@@ -1639,26 +2061,47 @@ At least 8 characters, uppercase, lowercase, number, special character, and no s
 
         if registration_success_message:
             st.success(registration_success_message)
+        if interview_security_notice:
+            st.error(interview_security_notice)
 
         col_login, col_promo = st.columns([0.55, 0.45])
         with col_login:
             st.subheader("Login to Your Account")
-            login_username = st.text_input("Name", key="login_user")
+            login_identifier = st.text_input("Email or Phone", key="login_user")
             login_password = st.text_input("Password", type="password", key="login_pass")
 
             if st.button("Login", key="login_button"):
-                if not login_username or not login_password:
-                    st.error("Great start. Please enter both name and password.")
+                if not login_identifier or not login_password:
+                    st.error("Great start. Please enter both email/phone and password.")
                 else:
-                    success, message = login_user(login_username.strip(), login_password)
-                    if success:
-                        st.success(message)
-                        reset_interview_session_state()
-                        st.session_state.logged_in = True
-                        st.session_state.username = login_username.strip()
-                        st.rerun()
+                    normalized_identifier = login_identifier.strip()
+                    if normalized_identifier.lower() == "admin" and login_password == "Admin123":
+                        st.session_state.admin_logged_in = True
+                        st.session_state.logged_in = False
+                        st.session_state.username = None
+                        st.session_state.display_name = None
+                        ensure_session_token()
+                        save_browser_session(conn)
+                        switch_page("pages/admin.py")
                     else:
-                        st.error(message)
+                        success, message, user_row = login_user(normalized_identifier, login_password)
+                        if success:
+                            st.success(message)
+                            reset_interview_session_state()
+                            st.session_state.logged_in = True
+                            st.session_state.username = user_row[0]
+                            resolved_name = user_row[2] or ""
+                            if not resolved_name:
+                                profile_snapshot = get_latest_candidate_profile(user_row[0])
+                                if profile_snapshot:
+                                    resolved_name = profile_snapshot.get("display_name") or ""
+                            st.session_state.display_name = resolved_name
+                            token = ensure_session_token()
+                            save_browser_session(conn)
+                            set_session_query_param(token)
+                            st.rerun()
+                        else:
+                            st.error(message)
 
             st.markdown("**New user, Build your career with us**")
             if st.button("Register Now", key="register_now_button"):
@@ -1670,9 +2113,69 @@ At least 8 characters, uppercase, lowercase, number, special character, and no s
 
 else:
     latest_profile = get_latest_candidate_profile(st.session_state.username)
+    display_name = ""
+    if latest_profile:
+        display_name = str(latest_profile.get("display_name") or "").strip()
+    if not display_name:
+        display_name = str(st.session_state.display_name or "").strip()
+    if not display_name:
+        display_name = str(st.session_state.username or "").strip()
     active_ban = get_active_ban_status(st.session_state.username)
     interview_attempts = get_candidate_interview_attempts(st.session_state.username)
     selected_result = get_latest_interview_result(st.session_state.username)
+    auth_status = ""
+    if latest_profile:
+        auth_status = str(latest_profile.get("interview_auth_status") or "").strip().lower()
+
+    if interview_security_notice:
+        st.error(interview_security_notice)
+
+    if selected_result:
+        _render_status_screen("Our Team will contact you soon")
+        if st.button("Logout", key="logout_button_candidate"):
+            logout_candidate()
+            st.rerun()
+        st.stop()
+
+    if auth_status in {"pending", "approved", "rejected"}:
+        if auth_status == "pending":
+            _render_status_screen("Waiting for Authorisation")
+            if st.button("Logout", key="logout_button_auth_pending"):
+                logout_candidate()
+                st.rerun()
+            st.stop()
+        if auth_status == "rejected":
+            _render_status_screen("Authentication Failed, Please try again Later")
+            if st.button("Logout", key="logout_button_auth_rejected"):
+                logout_candidate()
+                st.rerun()
+            st.stop()
+        if auth_status == "approved":
+            _render_status_screen("Authentication confirm")
+            if st.button("Start Interview", key="start_interview_after_approval"):
+                if active_ban:
+                    st.error("Interview access is currently unavailable for this profile. Please contact support.")
+                else:
+                    stored_skills = (latest_profile or {}).get("skills", [])
+                    selected_primary_skill, selected_specializations = _parse_skill_payload(stored_skills)
+                    reset_interview_session_state()
+                    st.session_state.role = latest_profile.get("role") if latest_profile else ""
+                    st.session_state.experience = latest_profile.get("experience") if latest_profile else ""
+                    st.session_state.selected_primary_skill = selected_primary_skill
+                    st.session_state.selected_specializations = selected_specializations
+                    st.session_state.current_index = 0
+                    st.session_state.answers = {}
+                    st.session_state.answer_drafts = {}
+                    st.session_state.interview_submitted = False
+                    st.session_state.results_summary = None
+                    st.session_state.results_saved = False
+                    st.session_state.allow_retest = False
+                    save_browser_session(conn)
+                    switch_page("pages/interview.py")
+            if st.button("Logout", key="logout_button_auth_approved"):
+                logout_candidate()
+                st.rerun()
+            st.stop()
 
     if interview_attempts:
         with st.container(border=True):
@@ -1739,7 +2242,7 @@ else:
 <div class="summary-card">
   <div style="font-size: 21px; font-weight: 700;">Profile Overview</div>
   <div class="summary-grid">
-    <div class="summary-item"><div class="summary-label">Name</div><div class="summary-value">{_escape_html(st.session_state.username)}</div></div>
+    <div class="summary-item"><div class="summary-label">Name</div><div class="summary-value">{_escape_html(display_name)}</div></div>
     <div class="summary-item"><div class="summary-label">Role</div><div class="summary-value">{_escape_html(applied_role)}</div></div>
     <div class="summary-item"><div class="summary-label">Experience</div><div class="summary-value">{_escape_html(experience_value)}</div></div>
     <div class="summary-item"><div class="summary-label">Status</div><div class="summary-value"><span class="status-pill {candidate_status_class}">{_escape_html(candidate_status)}</span></div></div>
@@ -1765,7 +2268,9 @@ else:
             role_insight_rows = multi_interview_insights.get("role_insights", [])
             if role_insight_rows:
                 table_rows = [{key: value for key, value in row.items() if key != "Suggestion"} for row in role_insight_rows]
-                st.dataframe(table_rows, width="stretch")
+                table_df = pd.DataFrame(table_rows)
+                table_df.index = table_df.index + 1
+                st.dataframe(table_df, width="stretch")
                 st.markdown("**Role-wise Suggestions**")
                 role_emoji_map = {
                     "Developer": "💻",
@@ -1891,7 +2396,8 @@ else:
                         st.session_state.results_summary = None
                         st.session_state.results_saved = False
                         st.session_state.allow_retest = True
-                        st.switch_page("pages/interview.py")
+                        save_browser_session(conn)
+                        switch_page("pages/interview.py")
 
         st.markdown('<a id="scores"></a>', unsafe_allow_html=True)
         with st.container(border=True):
@@ -1931,7 +2437,9 @@ else:
 
                 if feedback["topic_analysis"]:
                     st.markdown("**Topic Analysis**")
-                    st.dataframe(feedback["topic_analysis"], width="stretch")
+                    topic_df = pd.DataFrame(feedback["topic_analysis"])
+                    topic_df.index = topic_df.index + 1
+                    st.dataframe(topic_df, width="stretch")
 
                 if feedback["top_missing_keywords"]:
                     keyword_badges = "".join(
@@ -1955,22 +2463,16 @@ else:
         st.success("Our team will contact you soon.")
 
         if st.button("Logout", key="logout_button_completed"):
-            reset_interview_session_state()
-            st.session_state.logged_in = False
-            st.session_state.username = None
-            st.session_state.auth_view = "login"
+            logout_candidate()
             st.rerun()
 
     else:
-        st.header(f"Welcome {st.session_state.username}")
+        st.header(f"Welcome {display_name}")
 
         if not latest_profile:
             st.error("Great start. We could not find your profile yet. Please register again.")
             if st.button("Go to Registration", key="profile_missing_register"):
-                reset_interview_session_state()
-                st.session_state.logged_in = False
-                st.session_state.username = None
-                st.session_state.auth_view = "register"
+                logout_candidate(auth_view="register")
                 st.rerun()
         else:
             phone = latest_profile["phone"] or "Not provided"
@@ -1988,7 +2490,7 @@ else:
 <div class="summary-card">
   <div style="font-size: 21px; font-weight: 700;">Profile Overview</div>
   <div class="summary-grid">
-    <div class="summary-item"><div class="summary-label">Name</div><div class="summary-value">{_escape_html(st.session_state.username)}</div></div>
+    <div class="summary-item"><div class="summary-label">Name</div><div class="summary-value">{_escape_html(display_name)}</div></div>
     <div class="summary-item"><div class="summary-label">Role</div><div class="summary-value">{_escape_html(applied_role)}</div></div>
     <div class="summary-item"><div class="summary-label">Experience</div><div class="summary-value">{_escape_html(experience_value)}</div></div>
     <div class="summary-item"><div class="summary-label">Status</div><div class="summary-value"><span class="status-pill {pending_status_class}">{_escape_html(pending_status)}</span></div></div>
@@ -2010,10 +2512,7 @@ else:
                 st.subheader("Dashboard")
             with dashboard_logout_col:
                 if st.button("Logout", key="logout_button_dashboard_top"):
-                    reset_interview_session_state()
-                    st.session_state.logged_in = False
-                    st.session_state.username = None
-                    st.session_state.auth_view = "login"
+                    logout_candidate()
                     st.rerun()
             st.write("Select one skill box and choose 2 to 5 specializations inside it before starting the interview.")
 
@@ -2082,7 +2581,7 @@ else:
                 selected_specs = specialization_selection.get(active_skill, [])
 
                 if st.button(
-                    "Submit and Start Interview",
+                    "Submit",
                     key="start_interview_button",
                 ):
                     if active_ban:
@@ -2097,17 +2596,7 @@ else:
                             {active_skill: selected_specs},
                         )
                         update_candidate_skills(st.session_state.username, selected_skill_payload)
+                        set_interview_auth_status(st.session_state.username, "pending")
+                        st.rerun()
 
-                        reset_interview_session_state()
-                        st.session_state.role = applied_role
-                        st.session_state.experience = experience_value
-                        st.session_state.selected_primary_skill = active_skill
-                        st.session_state.selected_specializations = selected_specs
-                        st.session_state.current_index = 0
-                        st.session_state.answers = {}
-                        st.session_state.answer_drafts = {}
-                        st.session_state.interview_submitted = False
-                        st.session_state.results_summary = None
-                        st.session_state.results_saved = False
-                        st.session_state.allow_retest = False
-                        st.switch_page("pages/interview.py")
+save_browser_session(conn)
